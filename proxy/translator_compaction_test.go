@@ -12,6 +12,7 @@ import (
 // The generated payload must NOT carry any structured toolUses/toolResults in
 // history, since Kiro's upstream rejects those.
 func TestClaudeToKiroFlattensHistoryToolCyclesForCompaction(t *testing.T) {
+	pinLegacyToolHistory(t)
 	req := &ClaudeRequest{
 		Model: "claude-opus-4.8",
 		Messages: []ClaudeMessage{
@@ -129,5 +130,57 @@ func TestClaudeToKiroKeepsActiveToolTurnStructured(t *testing.T) {
 	}
 	if cur.UserInputMessageContext.ToolResults[0].ToolUseID != "t9" {
 		t.Fatalf("expected current tool result to answer t9, got %q", cur.UserInputMessageContext.ToolResults[0].ToolUseID)
+	}
+}
+
+// Structured mode (default): the upstream accepts structured tool cycles in
+// every history turn (verified against production 2026-08-18), so they must be
+// preserved — flattening them teaches the model a chatty one-message-per-turn
+// pattern. Tool spec re-declarations are still stripped from history.
+func TestClaudeToKiroKeepsStructuredToolHistory(t *testing.T) {
+	old := structuredToolHistoryEnabled
+	structuredToolHistoryEnabled = true
+	t.Cleanup(func() { structuredToolHistoryEnabled = old })
+
+	req := &ClaudeRequest{
+		Model: "claude-opus-4.8",
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "run the build"},
+			{Role: "assistant", Content: []interface{}{
+				map[string]interface{}{"type": "text", "text": "running build"},
+				map[string]interface{}{"type": "tool_use", "id": "t1", "name": "exec_command", "input": map[string]interface{}{"cmd": "make"}},
+			}},
+			{Role: "user", Content: []interface{}{
+				map[string]interface{}{"type": "tool_result", "tool_use_id": "t1", "content": "build ok"},
+			}},
+			{Role: "assistant", Content: []interface{}{
+				map[string]interface{}{"type": "tool_use", "id": "t2", "name": "exec_command", "input": map[string]interface{}{"cmd": "test"}},
+			}},
+			{Role: "user", Content: []interface{}{
+				map[string]interface{}{"type": "tool_result", "tool_use_id": "t2", "content": "tests pass"},
+			}},
+			{Role: "user", Content: "now package it"},
+		},
+	}
+
+	payload := ClaudeToKiro(req, false)
+
+	var keptUses, keptResults int
+	for i, h := range payload.ConversationState.History {
+		if a := h.AssistantResponseMessage; a != nil {
+			keptUses += len(a.ToolUses)
+		}
+		if u := h.UserInputMessage; u != nil && u.UserInputMessageContext != nil {
+			if len(u.UserInputMessageContext.Tools) > 0 {
+				t.Fatalf("history[%d] must not redeclare tool specs", i)
+			}
+			keptResults += len(u.UserInputMessageContext.ToolResults)
+		}
+	}
+	if keptUses != 2 {
+		t.Fatalf("structured mode must keep all history toolUses, got %d", keptUses)
+	}
+	if keptResults != 2 {
+		t.Fatalf("structured mode must keep all history toolResults, got %d", keptResults)
 	}
 }

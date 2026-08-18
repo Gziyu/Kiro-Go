@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -32,6 +33,11 @@ const (
 	streamRetryBackoff           = 700 * time.Millisecond
 	maxStreamAttemptsPerEndpoint = 2
 	maxEventStreamMessageSize    = 16 * 1024 * 1024
+
+	// responseHeaderTimeout bounds only the wait for upstream response
+	// headers (time to first byte). It must NOT be a whole-request timeout:
+	// streamed model turns legitimately run for many minutes.
+	responseHeaderTimeout = 90 * time.Second
 )
 
 var (
@@ -39,8 +45,14 @@ var (
 	errIncompleteKiroToolInput = errors.New("upstream stream ended with incomplete tool input")
 	errInvalidKiroEventStream  = errors.New("invalid upstream event stream")
 	errKiroEventStreamUpstream = errors.New("upstream event stream error")
+	errStreamIdleTimeout       = errors.New("upstream stream idle timeout")
 	streamRetryWait            = waitForStreamRetry
 	resolveKiroEndpoints       = endpointsForAccount
+	// streamIdleTimeout bounds the gap between events on an established
+	// stream. Kiro emits reasoning/text events continuously while working,
+	// so a multi-minute silence means the connection is dead, not thinking.
+	// It is a var so tests can shrink the watchdog window.
+	streamIdleTimeout = 120 * time.Second
 )
 
 // Endpoint configuration (auto-fallback on quota exhaustion).
@@ -101,8 +113,11 @@ func GetClientForProxy(proxyURL string) *http.Client {
 	if cached, ok := proxyClientCache.Load(proxyURL); ok {
 		return cached.(*http.Client)
 	}
+	// No http.Client.Timeout here: it would bound the entire streamed
+	// response body and kill any turn streaming longer than the timeout.
+	// Time bounds live on the transport (headers) and the idle watchdog
+	// (established stream) instead.
 	client := &http.Client{
-		Timeout:   5 * time.Minute,
 		Transport: buildKiroTransport(proxyURL),
 	}
 	proxyClientCache.Store(proxyURL, client)
@@ -139,11 +154,12 @@ func ResolveAccountProxyURL(account *config.Account) string {
 // buildKiroTransport constructs an HTTP Transport with optional outbound proxy support.
 func buildKiroTransport(proxyURL string) *http.Transport {
 	t := &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 20,
-		IdleConnTimeout:     90 * time.Second,
-		DisableCompression:  false,
-		ForceAttemptHTTP2:   true,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   20,
+		IdleConnTimeout:       90 * time.Second,
+		DisableCompression:    false,
+		ForceAttemptHTTP2:     true,
+		ResponseHeaderTimeout: responseHeaderTimeout,
 	}
 	if proxyURL != "" {
 		if u, err := url.Parse(proxyURL); err == nil {
@@ -159,8 +175,8 @@ func buildKiroTransport(proxyURL string) *http.Transport {
 
 // InitKiroHttpClient initializes (or reinitializes) the HTTP clients used for Kiro API requests.
 func InitKiroHttpClient(proxyURL string) {
+	// Streaming client: no total Timeout (see GetClientForProxy).
 	client := &http.Client{
-		Timeout:   5 * time.Minute,
 		Transport: buildKiroTransport(proxyURL),
 	}
 	kiroHttpStore.Store(client)
@@ -271,6 +287,24 @@ type KiroStreamCallback struct {
 	OnCredits      func(credits float64)
 	OnContextUsage func(percentage float64)
 	OnStopReason   func(reason string)
+	// OnStreamEnd fires once at a clean EOF with the stream's terminal
+	// state, before OnComplete. Used for truncation forensics/recovery.
+	OnStreamEnd func(info StreamEndInfo)
+}
+
+// StreamEndInfo summarizes how an upstream stream terminated at clean EOF.
+// The IDE endpoint routinely omits stopReason, so completeness is judged
+// from these signals instead.
+type StreamEndInfo struct {
+	StopReason    string
+	TerminalUsage bool // metering or contextUsage events arrived (terminal on the wire)
+	AnswerChars   int  // runes of answer (non-thinking) text
+	AnswerTail    string
+	ToolCount     int
+	SawReasoning  bool
+	// ContentLengthExceeded: the upstream cut the completion at its own
+	// content limit and said so via an exception frame.
+	ContentLengthExceeded bool
 }
 
 // ==================== API Call ====================
@@ -431,9 +465,13 @@ endpointLoop:
 			if err := ctx.Err(); err != nil {
 				return err
 			}
+			// Each attempt gets its own context so the idle watchdog can kill
+			// a silent-dead stream without touching the caller's context.
+			streamCtx, streamCancel := context.WithCancel(ctx)
 			// Requests and bodies cannot be reused after an HTTP attempt.
-			req, err := http.NewRequestWithContext(ctx, "POST", epURL, bytes.NewReader(reqBody))
+			req, err := http.NewRequestWithContext(streamCtx, "POST", epURL, bytes.NewReader(reqBody))
 			if err != nil {
+				streamCancel()
 				lastErr = err
 				continue endpointLoop
 			}
@@ -461,16 +499,21 @@ endpointLoop:
 
 			resp, err := GetClientForProxy(ResolveAccountProxyURL(account)).Do(req)
 			if err != nil {
+				streamCancel()
 				lastErr = err
 				logger.Warnf("[KiroAPI] Endpoint %s failed: %v", ep.Name, err)
-				if !isRetryableStreamError(err) {
-					return err
+				if ctx.Err() != nil {
+					return ctx.Err()
 				}
+				// No output can have been emitted before response headers
+				// arrive, so even header-timeout failures are safe to fail
+				// over to the next endpoint.
 				continue endpointLoop
 			}
 
 			if resp.StatusCode == 429 {
 				resp.Body.Close()
+				streamCancel()
 				logger.Warnf("[KiroAPI] Endpoint %s quota exhausted (429), trying next...", ep.Name)
 				lastErr = fmt.Errorf("quota exhausted on %s", ep.Name)
 				continue endpointLoop
@@ -479,6 +522,7 @@ endpointLoop:
 			if resp.StatusCode != 200 {
 				errBody, _ := io.ReadAll(resp.Body)
 				resp.Body.Close()
+				streamCancel()
 				lastErr = fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, ep.Name, string(errBody))
 				// Authentication errors and payment errors are not retried across endpoints.
 				if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 402 {
@@ -488,10 +532,49 @@ endpointLoop:
 				continue endpointLoop
 			}
 
-			emitted, err := parseEventStreamTracked(resp.Body, callback)
+			// Idle watchdog: if the upstream stops sending events for
+			// streamIdleTimeout the connection is dead (Kiro emits
+			// reasoning/text events continuously while working), so cancel
+			// this attempt's context to unblock the body read. The timeout
+			// is captured up front: the goroutine may briefly outlive the
+			// attempt and must not re-read the (test-overridable) package var.
+			idleTimeout := streamIdleTimeout
+			activity := make(chan struct{}, 1)
+			watchdogDone := make(chan struct{})
+			var watchdogFired atomic.Bool
+			go func() {
+				timer := time.NewTimer(idleTimeout)
+				defer timer.Stop()
+				for {
+					select {
+					case <-activity:
+						if !timer.Stop() {
+							select {
+							case <-timer.C:
+							default:
+							}
+						}
+						timer.Reset(idleTimeout)
+					case <-watchdogDone:
+						return
+					case <-timer.C:
+						watchdogFired.Store(true)
+						streamCancel()
+						return
+					}
+				}
+			}()
+			emitted, err := parseEventStreamTracked(&activitySignalingReader{r: resp.Body, activity: activity}, callback)
+			close(watchdogDone)
 			resp.Body.Close()
+			streamCancel()
 			if err == nil {
 				return nil
+			}
+			// A watchdog cancel surfaces as context.Canceled from the body
+			// read; reclassify it so it is not mistaken for a caller cancel.
+			if watchdogFired.Load() && ctx.Err() == nil {
+				err = errStreamIdleTimeout
 			}
 			lastErr = err
 			// "Emitted" deliberately means that an output callback ran. This
@@ -532,11 +615,34 @@ endpointLoop:
 }
 
 func isRetryableStreamError(err error) bool {
+	if errors.Is(err, errStreamIdleTimeout) {
+		// The watchdog killed a silent upstream; a fresh request is the fix.
+		return true
+	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
 	var netErr net.Error
 	return !errors.As(err, &netErr) || !netErr.Timeout()
+}
+
+// activitySignalingReader wraps a stream body and signals liveness on every
+// successful read, so the idle watchdog can distinguish a silent-dead
+// connection from a slow but healthy one.
+type activitySignalingReader struct {
+	r        io.Reader
+	activity chan<- struct{}
+}
+
+func (a *activitySignalingReader) Read(p []byte) (int, error) {
+	n, err := a.r.Read(p)
+	if n > 0 {
+		select {
+		case a.activity <- struct{}{}:
+		default:
+		}
+	}
+	return n, err
 }
 
 func accountEmailForLog(account *config.Account) string {
@@ -555,6 +661,29 @@ func waitForStreamRetry(ctx context.Context, delay time.Duration) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+// streamDumpDir, when set (KIRO_STREAM_DUMP_DIR), triggers a full forensic
+// dump of every stream that ends without a stopReason: event sequence, full
+// answer text and reasoning. For hunting the upstream's mid-content cuts.
+var streamDumpDir = strings.TrimSpace(os.Getenv("KIRO_STREAM_DUMP_DIR"))
+
+// dumpStreamForensics writes one cut stream's decoded content to a timestamped
+// file for offline analysis. Best-effort; failures are logged, never fatal.
+func dumpStreamForensics(dir string, eventSeq []string, answer, reasoning string, ctxPct float64) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		logger.Warnf("[KiroStream] dump dir: %v", err)
+		return
+	}
+	name := fmt.Sprintf("%s/cut-%d.log", dir, time.Now().UnixNano())
+	var b strings.Builder
+	fmt.Fprintf(&b, "ctxPct=%.1f\nevents=%v\n\n=== ANSWER (%d chars) ===\n%s\n\n=== REASONING (%d chars) ===\n%s\n",
+		ctxPct, eventSeq, len([]rune(answer)), answer, len([]rune(reasoning)), reasoning)
+	if err := os.WriteFile(name, []byte(b.String()), 0o600); err != nil {
+		logger.Warnf("[KiroStream] dump write: %v", err)
+		return
+	}
+	logger.Infof("[KiroStream] dumped cut stream to %s", name)
 }
 
 // ==================== Event Stream Parsing ====================
@@ -578,6 +707,19 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 	var totalCredits float64
 	var contextUsagePercentages []float64
 	var sawOutput bool
+	// Truncation forensics: the wire has no explicit end-of-stream frame, so
+	// when EOF arrives without stopReason the terminal event pattern is the
+	// only way to tell a complete turn from a stream that died mid-answer.
+	var sawStopReason, sawMetering, sawContextUsageEvent bool
+	var contentLengthExceeded bool
+	// Optional full-stream dump for cut forensics (KIRO_STREAM_DUMP_DIR).
+	var fullAnswer, fullReasoning strings.Builder
+	var eventSeq []string
+	var eventTail []string
+	var answerTail []rune
+	var answerChars, deliveredTools int
+	var sawReasoning bool
+	var streamStopReason string
 	pending := &pendingToolUses{}
 	trackedCallback := *callback
 	originalOnToolUse := trackedCallback.OnToolUse
@@ -585,6 +727,7 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 		sawOutput = true
 		if originalOnToolUse != nil {
 			emitted = true
+			deliveredTools++
 			originalOnToolUse(toolUse)
 		}
 	}
@@ -639,15 +782,44 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 			if detail == "" {
 				detail = messageType
 			}
+			// ContentLengthExceededException is the upstream's output-limit
+			// signal, not a failure: treat it as a max_tokens stop so the
+			// client gets a graceful capped turn (kiro.rs maps it the same
+			// way) instead of a hard error after partial content.
+			if strings.Contains(detail, "ContentLengthExceeded") {
+				contentLengthExceeded = true
+				streamStopReason = "max_tokens"
+				if callback.OnStopReason != nil {
+					callback.OnStopReason("max_tokens")
+				}
+				break
+			}
 			return emitted, fmt.Errorf("%w: %s", errKiroEventStreamUpstream, detail)
 		}
 
 		inputTokens, outputTokens = updateTokensFromEvent(event, inputTokens, outputTokens)
 
-		switch headers[":event-type"] {
+		lastEventType := headers[":event-type"]
+		eventTail = append(eventTail, lastEventType)
+		if len(eventTail) > 8 {
+			eventTail = eventTail[1:]
+		}
+		if streamDumpDir != "" {
+			eventSeq = append(eventSeq, lastEventType)
+		}
+		switch lastEventType {
 		case "assistantResponseEvent":
 			if content, ok := event["content"].(string); ok && content != "" {
 				sawOutput = true
+				runes := []rune(content)
+				answerChars += len(runes)
+				answerTail = append(answerTail, runes...)
+				if len(answerTail) > 60 {
+					answerTail = answerTail[len(answerTail)-60:]
+				}
+				if streamDumpDir != "" && fullAnswer.Len() < 1<<20 {
+					fullAnswer.WriteString(content)
+				}
 				if callback.OnText != nil {
 					emitted = true
 					callback.OnText(content, false)
@@ -656,6 +828,10 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 		case "reasoningContentEvent":
 			if text, ok := event["text"].(string); ok && text != "" {
 				sawOutput = true
+				sawReasoning = true
+				if streamDumpDir != "" && fullReasoning.Len() < 1<<20 {
+					fullReasoning.WriteString(text)
+				}
 				if callback.OnText != nil {
 					emitted = true
 					callback.OnText(text, true)
@@ -666,10 +842,12 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 				return emitted, toolErr
 			}
 		case "meteringEvent":
+			sawMetering = true
 			if usage, ok := event["usage"].(float64); ok {
 				totalCredits += usage
 			}
 		case "contextUsageEvent":
+			sawContextUsageEvent = true
 			if pct, ok := event["contextUsagePercentage"].(float64); ok {
 				contextUsagePercentages = append(contextUsagePercentages, pct)
 			}
@@ -677,8 +855,12 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 			// stopReason rides inside metadataEvent on the wire; there is no
 			// standalone stop reason event type. Its absence after content is
 			// how callers detect a truncated stream.
-			if reason := firstStringField(event, "stopReason", "stop_reason"); reason != "" && callback.OnStopReason != nil {
-				callback.OnStopReason(reason)
+			if reason := firstStringField(event, "stopReason", "stop_reason"); reason != "" {
+				sawStopReason = true
+				streamStopReason = reason
+				if callback.OnStopReason != nil {
+					callback.OnStopReason(reason)
+				}
 			}
 		}
 	}
@@ -689,6 +871,32 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 	}
 	if !sawOutput {
 		return emitted, errEmptyKiroStream
+	}
+	if callback.OnStreamEnd != nil {
+		callback.OnStreamEnd(StreamEndInfo{
+			StopReason:            streamStopReason,
+			TerminalUsage:         sawMetering || sawContextUsageEvent,
+			AnswerChars:           answerChars,
+			AnswerTail:            string(answerTail),
+			ToolCount:             deliveredTools,
+			SawReasoning:          sawReasoning,
+			ContentLengthExceeded: contentLengthExceeded,
+		})
+	}
+	if !sawStopReason {
+		// Routine on the IDE endpoint (complete turns often omit metadataEvent);
+		// runKiroWithIntegrityRetry logs real truncations at WARN. ctxPct is the
+		// server-reported context fill: cuts cluster at high values when the
+		// upstream's real window is much smaller than the advertised one.
+		ctxPct := 0.0
+		if len(contextUsagePercentages) > 0 {
+			ctxPct = contextUsagePercentages[len(contextUsagePercentages)-1]
+		}
+		logger.Debugf("[KiroStream] EOF without stopReason: events=%v metering=%v ctxPct=%.1f chars=%d answerTail=%q",
+			eventTail, sawMetering, ctxPct, answerChars, string(answerTail))
+		if streamDumpDir != "" {
+			dumpStreamForensics(streamDumpDir, eventSeq, fullAnswer.String(), fullReasoning.String(), ctxPct)
+		}
 	}
 	if callback.OnCredits != nil && totalCredits > 0 {
 		callback.OnCredits(totalCredits)
@@ -1029,7 +1237,7 @@ func finishToolUse(state *toolUseState, callback *KiroStreamCallback) error {
 	var input map[string]interface{}
 	if state.InputBuffer.Len() > 0 {
 		if err := json.Unmarshal([]byte(state.InputBuffer.String()), &input); err != nil {
-			return fmt.Errorf("%w: %v", errIncompleteKiroToolInput, err)
+			return fmt.Errorf("%w: tool %q input (%d bytes): %v", errIncompleteKiroToolInput, state.Name, state.InputBuffer.Len(), err)
 		}
 	}
 	if input == nil {

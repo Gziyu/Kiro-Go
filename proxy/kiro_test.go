@@ -320,8 +320,17 @@ func TestInitKiroHttpClientKeepsShortRestTimeout(t *testing.T) {
 	streamClient := kiroHttpStore.Load()
 	restClient := kiroRestHttpStore.Load()
 
-	if streamClient.Timeout != 5*time.Minute {
-		t.Fatalf("expected streaming timeout to be 5m, got %s", streamClient.Timeout)
+	// A total Timeout on the streaming client would bound the whole response
+	// body read and kill any turn streaming longer than the timeout.
+	if streamClient.Timeout != 0 {
+		t.Fatalf("expected no total streaming timeout, got %s", streamClient.Timeout)
+	}
+	transport, ok := streamClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("expected *http.Transport, got %T", streamClient.Transport)
+	}
+	if transport.ResponseHeaderTimeout != responseHeaderTimeout {
+		t.Fatalf("expected response header timeout %s, got %s", responseHeaderTimeout, transport.ResponseHeaderTimeout)
 	}
 	if restClient.Timeout != 30*time.Second {
 		t.Fatalf("expected REST timeout to stay 30s, got %s", restClient.Timeout)
@@ -798,7 +807,7 @@ func TestCallKiroAPIDoesNotRetryTimedOutStream(t *testing.T) {
 	}
 }
 
-func TestCallKiroAPIDoesNotFallbackAfterTimedOutTransport(t *testing.T) {
+func TestCallKiroAPIFailsOverAfterTimedOutTransport(t *testing.T) {
 	installKiroRetryTestEndpoints(t)
 
 	var calls, waits int
@@ -816,8 +825,55 @@ func TestCallKiroAPIDoesNotFallbackAfterTimedOutTransport(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("expected deadline error, got %v", err)
 	}
-	if calls != 1 || waits != 0 {
-		t.Fatalf("calls=%d waits=%d, want no fallback or wait after deadline", calls, waits)
+	// The caller's context is still alive here, so the transport-level
+	// timeout came from the upstream (e.g. ResponseHeaderTimeout). No output
+	// can have been emitted before response headers, so failover is safe.
+	if calls != 2 || waits != 0 {
+		t.Fatalf("calls=%d waits=%d, want failover to second endpoint without wait", calls, waits)
+	}
+}
+
+// ctxBlockingReader simulates an upstream stream that opens and then goes
+// silent: it produces no bytes until the request context is canceled.
+type ctxBlockingReader struct{ ctx context.Context }
+
+func (r ctxBlockingReader) Read([]byte) (int, error) {
+	<-r.ctx.Done()
+	return 0, r.ctx.Err()
+}
+
+func TestCallKiroAPIRetriesStreamThatGoesIdle(t *testing.T) {
+	installKiroRetryTestEndpoints(t)
+
+	oldIdle := streamIdleTimeout
+	streamIdleTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { streamIdleTimeout = oldIdle })
+
+	var calls int
+	var text string
+	installKiroStreamTestClient(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		if calls == 1 {
+			return kiroStreamTestResponse(ctxBlockingReader{ctx: req.Context()}), nil
+		}
+		return kiroStreamTestResponse(bytes.NewReader(awsEventStreamFrame(t,
+			"assistantResponseEvent", map[string]interface{}{"content": "recovered"}))), nil
+	}))
+	installKiroRetryWait(t, func(time.Duration) {})
+
+	err := CallKiroAPI(
+		newKiroRetryTestOAuthAccount(),
+		newKiroRetryTestPayload(),
+		&KiroStreamCallback{OnText: func(chunk string, _ bool) { text += chunk }},
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("calls=%d, want retry after idle watchdog killed the silent stream", calls)
+	}
+	if text != "recovered" {
+		t.Fatalf("text=%q, want recovered", text)
 	}
 }
 

@@ -45,34 +45,33 @@ var errUpstreamTruncatedResponse = errors.New("upstream truncated response witho
 // clean EOF, so a stream that died mid-answer is otherwise indistinguishable
 // from a finished one.
 //
-// Complete when a stopReason arrived, or when a tool call was delivered. Both
-// match Kiro IDE, whose empty and truncation predicates each require
-// toolCallCount === 0.
+// Complete when any of:
+//   - a stopReason arrived, or
+//   - a tool call was delivered, or
+//   - answer content arrived AND terminal usage accounting (metering or
+//     contextUsage events) followed it. Production forensics on the IDE
+//     endpoint (2026-08-18) showed complete turns routinely omit metadataEvent
+//     but always end with the usage events; a stream that dies mid-answer
+//     never reaches them.
 //
-// Truncated when content arrived without any terminal signal.
-//
-// Reasoning-only with no answer is STRICTER THAN THE IDE, deliberately. The
-// IDE's truncation predicate ends in (contentChars > 0 || !reasoningSeen), so
-// reasoning with no answer and no stopReason is treated as complete there and
-// is never retried. That is the exact shape of the production symptom this
-// proxy exists to fix: thinking streams in full, then the turn dies before the
-// answer or the tool call. Handing a client reasoning with no answer as a
-// successful turn is what made the failure invisible, so it is classified as
-// truncated here.
-func classifyStreamIntegrity(contentChars, toolCallCount int, stopReason string, sawReasoning bool) error {
+// Content with neither stopReason nor terminal usage is a truncation: surface
+// it rather than forging end_turn mid-sentence.
+func classifyStreamIntegrity(contentChars, toolCallCount int, stopReason string, sawReasoning, terminalUsage bool) error {
 	if strings.TrimSpace(stopReason) != "" {
 		return nil
 	}
 	if toolCallCount > 0 {
 		return nil
 	}
+	if contentChars > 0 && terminalUsage {
+		return nil
+	}
 	if contentChars > 0 || sawReasoning {
 		return errUpstreamTruncatedResponse
 	}
 	// No content, no reasoning, no tools: unreachable through the wired paths
-	// (errEmptyKiroStream fires first, see above). Treated as truncated rather
-	// than complete so a future caller that bypasses that guard still cannot
-	// ship an empty turn as a success.
+	// (errEmptyKiroStream fires first, see above). Treat it as truncated so a
+	// future caller that bypasses that guard cannot ship an empty turn.
 	return errUpstreamTruncatedResponse
 }
 

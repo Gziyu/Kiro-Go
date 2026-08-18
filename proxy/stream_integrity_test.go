@@ -12,31 +12,31 @@ import (
 	"time"
 )
 
-// classifyStreamIntegrity is the completeness rule: a stream that returned no
-// transport error is still incomplete when it carries no terminal signal.
-// A stopReason of any value, or a delivered tool call, means complete.
-//
-// The reasoning-only case deliberately differs from Kiro IDE, which treats it
-// as complete. See classifyStreamIntegrity's doc comment for why this proxy is
-// stricter.
+// classifyStreamIntegrity treats a turn as complete on a stopReason, a
+// delivered tool call, or answer content followed by terminal usage events
+// (metering/contextUsage — the IDE endpoint routinely omits metadataEvent on
+// complete turns). Content with neither signal is a truncation.
 func TestClassifyStreamIntegrity(t *testing.T) {
 	for _, tc := range []struct {
-		name         string
-		content      int
-		tools        int
-		stopReason   string
-		sawReasoning bool
-		wantErr      error
+		name          string
+		content       int
+		tools         int
+		stopReason    string
+		sawReasoning  bool
+		terminalUsage bool
+		wantErr       error
 	}{
-		{"complete with stop", 12, 0, "end_turn", false, nil},
-		{"complete with tools", 0, 1, "", false, nil},
-		{"complete with tools despite content", 12, 1, "", false, nil},
-		{"truncated content", 8, 0, "", false, errUpstreamTruncatedResponse},
-		{"reasoning only stricter than ide", 0, 0, "", true, errUpstreamTruncatedResponse},
-		{"no signal at all", 0, 0, "", false, errUpstreamTruncatedResponse},
+		{"complete with stop", 12, 0, "end_turn", false, false, nil},
+		{"complete with tools", 0, 1, "", false, false, nil},
+		{"complete with tools despite content", 12, 1, "", false, false, nil},
+		{"content with terminal usage is complete", 8, 0, "", false, true, nil},
+		{"content without any terminal signal is truncated", 8, 0, "", false, false, errUpstreamTruncatedResponse},
+		{"reasoning only stricter than ide", 0, 0, "", true, false, errUpstreamTruncatedResponse},
+		{"reasoning only with usage still truncated", 0, 0, "", true, true, errUpstreamTruncatedResponse},
+		{"no signal at all", 0, 0, "", false, false, errUpstreamTruncatedResponse},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := classifyStreamIntegrity(tc.content, tc.tools, tc.stopReason, tc.sawReasoning)
+			got := classifyStreamIntegrity(tc.content, tc.tools, tc.stopReason, tc.sawReasoning, tc.terminalUsage)
 			if tc.wantErr == nil {
 				if got != nil {
 					t.Fatalf("got %v, want nil", got)
@@ -95,31 +95,17 @@ func integrityTestPayload() *KiroPayload {
 	return payload
 }
 
-// A stream that delivered content but no stopReason is truncated, not failed:
-// the transport layer sees success and returns nil. The helper must catch that,
-// reset the caller's accumulators, and retry on the same account.
-//
-// Note the fully-empty case is deliberately NOT used here: parseEventStreamTracked
-// already returns errEmptyKiroStream when nothing was output, and
-// CallKiroAPIContext retries it internally, so it never surfaces as a
-// transport-successful call.
-func TestRunKiroWithIntegrityRetryRecoversTruncatedThenComplete(t *testing.T) {
+// A stream that delivered answer content without stopReason is truncated:
+// controlled testing against the production backend showed complete turns
+// always carry a metadataEvent stopReason. Before anything is flushed it must
+// be retried; if every attempt truncates the error surfaces.
+func TestRunKiroWithIntegrityRetryRetriesContentWithoutMetadata(t *testing.T) {
 	var hits atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		n := hits.Add(1)
+		hits.Add(1)
 		w.WriteHeader(http.StatusOK)
-		if n == 1 {
-			// Content but no metadataEvent => transport-successful truncation.
-			_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
-				"content": "partial",
-			}))
-			return
-		}
 		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
-			"content": "recovered",
-		}))
-		_, _ = w.Write(awsEventStreamFrame(t, "metadataEvent", map[string]interface{}{
-			"stopReason": "end_turn",
+			"content": "complete answer",
 		}))
 	}))
 	defer server.Close()
@@ -143,25 +129,21 @@ func TestRunKiroWithIntegrityRetryRecoversTruncatedThenComplete(t *testing.T) {
 		},
 		nil,
 	)
-	if err != nil {
-		t.Fatalf("expected recovery, got %v", err)
+	if !errors.Is(err, errUpstreamTruncatedResponse) {
+		t.Fatalf("expected truncation error, got %v", err)
 	}
-	if got := hits.Load(); got != 2 {
-		t.Fatalf("expected exactly one retry (2 upstream hits), got %d", got)
+	if got := hits.Load(); got != 1+maxSameAccountStreamRetries {
+		t.Fatalf("content without stopReason must exhaust retries, hits=%d", got)
 	}
-	if resets < 1 {
-		t.Fatalf("expected reset before retry, got %d", resets)
-	}
-	// "partial" from the first attempt must not survive into the final result.
-	if content != "recovered" || stopReason != "end_turn" {
-		t.Fatalf("content=%q stopReason=%q", content, stopReason)
+	if resets != maxSameAccountStreamRetries {
+		t.Fatalf("expected %d resets, got %d", maxSameAccountStreamRetries, resets)
 	}
 }
 
-// Once the client has already been flushed, an incomplete stream must not be
-// retried (would duplicate output). Helper returns the integrity error so the
-// caller can emit an error event instead of forging a normal completion.
-func TestRunKiroWithIntegrityRetrySkipsRetryAfterClientFlush(t *testing.T) {
+// Once answer content has reached the client, a missing stopReason means the
+// stream was truncated mid-turn. Retry would duplicate output, so the error
+// must surface visibly instead of forging a successful end_turn.
+func TestRunKiroWithIntegrityRetrySignalsTruncationAfterClientFlush(t *testing.T) {
 	var hits atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
@@ -184,14 +166,14 @@ func TestRunKiroWithIntegrityRetrySkipsRetryAfterClientFlush(t *testing.T) {
 		func() { content = "" },
 		func() bool { return !flushed },
 	)
-	if !isStreamIntegrityError(err) {
-		t.Fatalf("expected integrity error after flush, got %v", err)
+	if !errors.Is(err, errUpstreamTruncatedResponse) {
+		t.Fatalf("expected truncation error after flush, got %v", err)
 	}
 	if hits.Load() != 1 {
-		t.Fatalf("must not retry after flush, hits=%d", hits.Load())
+		t.Fatalf("must not retry after client flush, hits=%d", hits.Load())
 	}
 	if content != "partial" {
-		t.Fatalf("content=%q", content)
+		t.Fatalf("flushed content must be preserved, content=%q", content)
 	}
 }
 
@@ -237,28 +219,31 @@ func TestRunKiroWithIntegrityRetryStopsOnCanceledContext(t *testing.T) {
 	}
 }
 
-// The truncation retry budget must stay bounded and must be spent, not silently
-// widened. Truncation never reaches the endpoint fallback (CallKiroAPIContext
-// returns nil for it), so the only multiplier is account rotation; see
-// maxSameAccountStreamRetries for the cost arithmetic.
+// The truncation retry budget stays bounded for reasoning-only turns. Text-only
+// turns are valid current-backend completions, while reasoning with no answer or
+// tool call remains incomplete and consumes the bounded retry budget.
 func TestRunKiroWithIntegrityRetryStopsAfterBudgetExhausted(t *testing.T) {
 	var hits atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
 		w.WriteHeader(http.StatusOK)
-		// Always truncated: content with no terminal signal.
-		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
-			"content": "partial",
+		// Always truncated: reasoning with no answer or terminal signal.
+		_, _ = w.Write(awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{
+			"text": "unfinished reasoning",
 		}))
 	}))
 	defer server.Close()
 	defer setupIntegrityTestUpstream(t, server)()
 
-	var content string
+	var reasoning string
 	err := runKiroWithIntegrityRetry(context.Background(), integrityTestAccount(), integrityTestPayload(),
-		&KiroStreamCallback{OnText: func(s string, _ bool) { content += s }},
-		func() (int, int, string, bool) { return len(content), 0, "", false },
-		func() { content = "" },
+		&KiroStreamCallback{OnText: func(s string, isReasoning bool) {
+			if isReasoning {
+				reasoning += s
+			}
+		}},
+		func() (int, int, string, bool) { return 0, 0, "", reasoning != "" },
+		func() { reasoning = "" },
 		nil,
 	)
 	if !isStreamIntegrityError(err) {

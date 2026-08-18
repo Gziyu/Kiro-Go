@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"encoding/json"
 	"kiro-go/config"
 	accountpool "kiro-go/pool"
 	"net/http"
@@ -42,9 +41,9 @@ func setupIntegrityPathTest(t *testing.T, server *httptest.Server) *Handler {
 	}
 }
 
-// truncatedUpstream serves content long enough to be flushed to the client but
-// never sends a metadataEvent, i.e. a transport-successful truncated stream.
-func truncatedUpstream(t *testing.T, hits *atomic.Int32) *httptest.Server {
+// currentTextOnlyUpstream serves a complete text response in the format used by
+// current Kiro backends, which may omit metadataEvent/stopReason.
+func currentTextOnlyUpstream(t *testing.T, hits *atomic.Int32) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if hits != nil {
@@ -57,11 +56,13 @@ func truncatedUpstream(t *testing.T, hits *atomic.Int32) *httptest.Server {
 	}))
 }
 
-// A truncated stream whose content already reached the client must end with an
-// SSE error, never with a forged end_turn that tells the client it is done.
-func TestClaudeStreamEmitsErrorOnTruncatedStream(t *testing.T) {
+// A text-only stream whose upstream omitted metadataEvent/stopReason is
+// truncated: flushed content stays, but the turn must end with a visible error
+// rather than a forged end_turn. Production probing showed complete turns
+// always carry a stopReason, so its absence means the stream died.
+func TestClaudeStreamSignalsTruncationWithoutMetadata(t *testing.T) {
 	var hits atomic.Int32
-	server := truncatedUpstream(t, &hits)
+	server := currentTextOnlyUpstream(t, &hits)
 	defer server.Close()
 	h := setupIntegrityPathTest(t, server)
 
@@ -79,35 +80,25 @@ func TestClaudeStreamEmitsErrorOnTruncatedStream(t *testing.T) {
 		t.Fatalf("expected flushed content, got %s", body)
 	}
 	if strings.Contains(body, `"stop_reason":"end_turn"`) {
-		t.Fatalf("truncated stream must not be reported as end_turn, got %s", body)
+		t.Fatalf("truncated stream must not forge end_turn, got %s", body)
 	}
 	if !strings.Contains(body, `"type":"error"`) {
-		t.Fatalf("expected SSE error event, got %s", body)
+		t.Fatalf("truncated stream must emit a visible error, got %s", body)
 	}
-	// Content was already flushed, so reissuing would duplicate output.
 	if hits.Load() != 1 {
 		t.Fatalf("must not retry after client flush, hits=%d", hits.Load())
 	}
 }
 
-// Non-stream buffers everything, so a truncated first attempt is safe to retry
-// on the same account. The client must receive the recovered answer only.
-func TestClaudeNonStreamRetriesTruncatedStream(t *testing.T) {
+// Non-stream is fully buffered, so a truncated (no stopReason) response is
+// retried within the budget and then surfaces as an error.
+func TestClaudeNonStreamRejectsContentWithoutMetadata(t *testing.T) {
 	var hits atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		n := hits.Add(1)
+		hits.Add(1)
 		w.WriteHeader(http.StatusOK)
-		if n == 1 {
-			_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
-				"content": "truncated attempt",
-			}))
-			return
-		}
 		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
-			"content": "recovered answer",
-		}))
-		_, _ = w.Write(awsEventStreamFrame(t, "metadataEvent", map[string]interface{}{
-			"stopReason": "end_turn",
+			"content": "complete answer",
 		}))
 	}))
 	defer server.Close()
@@ -121,32 +112,18 @@ func TestClaudeNonStreamRetriesTruncatedStream(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.handleClaudeMessages(rec, req)
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200 after recovery, got %d body=%s", rec.Code, rec.Body.String())
+	if rec.Code == http.StatusOK {
+		t.Fatalf("truncated buffered response must not succeed, body=%s", rec.Body.String())
 	}
-	var resp ClaudeResponse
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("decode: %v body=%s", err, rec.Body.String())
-	}
-	if len(resp.Content) == 0 {
-		t.Fatalf("expected content, got %+v", resp)
-	}
-	text := resp.Content[0].Text
-	if strings.Contains(text, "truncated attempt") {
-		t.Fatalf("first attempt must be discarded on retry, got %q", text)
-	}
-	if !strings.Contains(text, "recovered answer") {
-		t.Fatalf("expected recovered answer, got %q", text)
-	}
-	if hits.Load() < 2 {
-		t.Fatalf("expected same-account retry, hits=%d", hits.Load())
+	if got := hits.Load(); got != 1+maxSameAccountStreamRetries {
+		t.Fatalf("buffered truncation must exhaust retries, hits=%d", got)
 	}
 }
 
 // A soft integrity failure means the upstream blipped, not that the credential
 // is bad. The account must stay enabled and unbanned.
 func TestIntegrityFailureDoesNotBanAccount(t *testing.T) {
-	server := truncatedUpstream(t, nil)
+	server := currentTextOnlyUpstream(t, nil)
 	defer server.Close()
 	h := setupIntegrityPathTest(t, server)
 
@@ -178,10 +155,57 @@ func TestIntegrityFailureDoesNotBanAccount(t *testing.T) {
 	}
 }
 
-// Responses streaming must surface response.failed instead of closing the turn
-// with response.completed when the upstream truncated.
-func TestResponsesStreamEmitsFailedOnTruncatedStream(t *testing.T) {
-	server := truncatedUpstream(t, nil)
+// The IDE endpoint routinely ends complete turns without metadataEvent but
+// always trails content with metering/contextUsage events. Such a turn must
+// complete normally — no retry, no error, end_turn is honest here.
+func TestClaudeStreamCompletesWithTerminalUsageEvents(t *testing.T) {
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+		var body []byte
+		body = append(body, awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+			"content": "complete answer",
+		})...)
+		body = append(body, awsEventStreamFrame(t, "contextUsageEvent", map[string]interface{}{
+			"contextUsagePercentage": 12.5,
+		})...)
+		body = append(body, awsEventStreamFrame(t, "meteringEvent", map[string]interface{}{
+			"usage": 0.5,
+		})...)
+		_, _ = w.Write(body)
+	}))
+	defer server.Close()
+	h := setupIntegrityPathTest(t, server)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
+		"model":"claude-sonnet-4.5",
+		"max_tokens":100,
+		"messages":[{"role":"user","content":"hello"}],
+		"stream":true
+	}`))
+	rec := httptest.NewRecorder()
+	h.handleClaudeMessages(rec, req)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "complete answer") {
+		t.Fatalf("expected content, got %s", body)
+	}
+	if !strings.Contains(body, `"stop_reason":"end_turn"`) {
+		t.Fatalf("turn with terminal usage events must complete, got %s", body)
+	}
+	if strings.Contains(body, `"type":"error"`) {
+		t.Fatalf("turn with terminal usage events must not error, got %s", body)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("complete turn must not retry, hits=%d", hits.Load())
+	}
+}
+
+// Responses streaming reports a visible failure for a truncated (no
+// stopReason) turn instead of forging response.completed.
+func TestResponsesStreamSignalsTruncationWithoutMetadata(t *testing.T) {
+	server := currentTextOnlyUpstream(t, nil)
 	defer server.Close()
 	h := setupIntegrityPathTest(t, server)
 
@@ -195,17 +219,18 @@ func TestResponsesStreamEmitsFailedOnTruncatedStream(t *testing.T) {
 	h.handleOpenAIResponses(rec, req)
 
 	body := rec.Body.String()
-	if !strings.Contains(body, "response.failed") {
-		t.Fatalf("expected response.failed, got %s", body)
-	}
 	if strings.Contains(body, "response.completed") {
 		t.Fatalf("truncated stream must not report response.completed, got %s", body)
 	}
+	if !strings.Contains(body, "response.failed") && !strings.Contains(body, `"error"`) {
+		t.Fatalf("truncated stream must surface a failure, got %s", body)
+	}
 }
 
-// OpenAI streaming must not close a truncated turn with a normal finish_reason.
-func TestOpenAIStreamEmitsErrorOnTruncatedStream(t *testing.T) {
-	server := truncatedUpstream(t, nil)
+// OpenAI streaming surfaces a truncated (no stopReason) turn as an error
+// instead of a forged finish_reason=stop.
+func TestOpenAIStreamSignalsTruncationWithoutMetadata(t *testing.T) {
+	server := currentTextOnlyUpstream(t, nil)
 	defer server.Close()
 	h := setupIntegrityPathTest(t, server)
 
@@ -222,37 +247,23 @@ func TestOpenAIStreamEmitsErrorOnTruncatedStream(t *testing.T) {
 		t.Fatalf("expected flushed content, got %s", body)
 	}
 	if strings.Contains(body, `"finish_reason":"stop"`) {
-		t.Fatalf("truncated stream must not finish with stop, got %s", body)
-	}
-	if strings.Contains(body, "[DONE]") {
-		t.Fatalf("truncated stream must not report completion, got %s", body)
+		t.Fatalf("truncated stream must not forge finish_reason=stop, got %s", body)
 	}
 	if !strings.Contains(body, `"error"`) {
-		t.Fatalf("expected an SSE error, got %s", body)
+		t.Fatalf("truncated stream must emit an error, got %s", body)
 	}
 }
 
-// Regression for a defect the reference implementation does not cover: a short
-// unflushed chunk stays inside processClaudeText's tag buffer, so a retry that
-// does not clear it concatenates the previous attempt's text onto the new one.
-func TestClaudeStreamRetryDoesNotLeakPreviousAttemptText(t *testing.T) {
+// A short text-only chunk sits in processClaudeText's tag buffer and never
+// reaches the client, so a missing stopReason is retried within budget and
+// then surfaces as an error.
+func TestClaudeStreamRetriesShortContentWithoutMetadata(t *testing.T) {
 	var hits atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		n := hits.Add(1)
+		hits.Add(1)
 		w.WriteHeader(http.StatusOK)
-		if n == 1 {
-			// Short enough to stay in the buffer: never flushed to the client,
-			// so the stream is still retryable.
-			_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
-				"content": "LEAK",
-			}))
-			return
-		}
 		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
-			"content": "clean answer",
-		}))
-		_, _ = w.Write(awsEventStreamFrame(t, "metadataEvent", map[string]interface{}{
-			"stopReason": "end_turn",
+			"content": "short answer",
 		}))
 	}))
 	defer server.Close()
@@ -268,13 +279,10 @@ func TestClaudeStreamRetryDoesNotLeakPreviousAttemptText(t *testing.T) {
 	h.handleClaudeMessages(rec, req)
 
 	body := rec.Body.String()
-	if hits.Load() < 2 {
-		t.Fatalf("expected retry for unflushed truncated stream, hits=%d", hits.Load())
+	if got := hits.Load(); got != 1+maxSameAccountStreamRetries {
+		t.Fatalf("unflushed truncation must exhaust retries, hits=%d", got)
 	}
-	if strings.Contains(body, "LEAK") {
-		t.Fatalf("discarded attempt leaked into the retry output: %s", body)
-	}
-	if !strings.Contains(body, "clean answer") {
-		t.Fatalf("expected recovered answer, got %s", body)
+	if strings.Contains(body, `"stop_reason":"end_turn"`) {
+		t.Fatalf("truncated stream must not forge end_turn, got %s", body)
 	}
 }

@@ -11,6 +11,7 @@ import (
 // sanitizeKiroHistory then narrated again, producing the same output twice.
 // Each tool result's output must appear exactly once in history.
 func TestOpenAIToKiroDoesNotDuplicateToolResultText(t *testing.T) {
+	pinLegacyToolHistory(t)
 	req := &OpenAIRequest{
 		Model: "claude-opus-4.8",
 		Messages: []OpenAIMessage{

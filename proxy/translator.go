@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"kiro-go/config"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -311,6 +312,12 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	payload.ConversationState.AgentTaskType = "vibe"
 	payload.ConversationState.AgentContinuationId = uuid.New().String()
 	payload.ConversationState.ConversationID = buildConversationID(modelID, systemPrompt, firstClaudeConversationAnchor(req.Messages))
+	// A pending truncation advisory from the previous turn of this
+	// conversation rides along with this request so the model adapts
+	// (shorter replies, chunked writes) instead of hitting the same cut.
+	if notice := consumeTruncationNotice(payload.ConversationState.ConversationID); notice != "" {
+		finalContent = notice + "\n\n" + finalContent
+	}
 	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
 		Content: finalContent,
 		ModelID: modelID,
@@ -1583,6 +1590,18 @@ func joinHistoryText(existing, narrated string) string {
 	}
 }
 
+// structuredToolHistoryEnabled controls whether history keeps structured tool
+// cycles. Default ON: the upstream accepts structured toolUses/toolResults in
+// every history turn (verified against production 2026-08-18, and kiro.rs has
+// always done this), and flattening them into narrated text teaches the model
+// a chatty one-message-per-turn pattern — the "says one line then stops"
+// behavior seen in long agentic sessions. KIRO_STRUCTURED_TOOL_HISTORY=0
+// restores the legacy flattening.
+var structuredToolHistoryEnabled = func() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("KIRO_STRUCTURED_TOOL_HISTORY")))
+	return v != "0" && v != "false" && v != "off"
+}()
+
 // sanitizeKiroHistory flattens structured tool calls/results inside history into
 // plain text, leaving at most one active structured tool turn intact: the final
 // history assistant message whose tool-use IDs are answered by the current
@@ -1595,6 +1614,9 @@ func joinHistoryText(existing, narrated string) string {
 func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[string]bool) []KiroHistoryMessage {
 	if len(history) == 0 {
 		return history
+	}
+	if structuredToolHistoryEnabled {
+		return scrubStructuredHistory(history)
 	}
 
 	// Map every tool-use ID to its tool name across all assistant turns, so a
@@ -1713,6 +1735,64 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 
 	// Dropping hollow assistant turns can leave history starting with an
 	// assistant message; re-trim so it begins with a user turn.
+	return trimLeadingAssistantHistory(cleaned)
+}
+
+// scrubStructuredHistory is the structured-tool-history variant: tool cycles
+// stay structured in every turn (the upstream accepts them, and keeping them
+// preserves the act-observe-act pattern the model should imitate). It still:
+//   - scrubs replayed tool-call narration from assistant text,
+//   - strips tool SPEC re-declarations from history user turns (they are
+//     resent in the current message),
+//   - drops assistant turns with neither content nor tool calls, and collapses
+//     consecutive identical user turns (retry-loop guard).
+func scrubStructuredHistory(history []KiroHistoryMessage) []KiroHistoryMessage {
+	cleaned := history[:0:0]
+	for i := range history {
+		msg := history[i]
+
+		if a := msg.AssistantResponseMessage; a != nil {
+			if a.Content != "" {
+				a.Content = stripPollutedToolCallText(a.Content)
+			}
+			if len(a.ToolUses) == 0 {
+				c := strings.TrimSpace(a.Content)
+				if c == "" || c == minimalFallbackUserContent {
+					continue // drop hollow assistant turn
+				}
+			}
+		}
+
+		if u := msg.UserInputMessage; u != nil {
+			if u.UserInputMessageContext != nil {
+				// History messages must not carry structured tool specs.
+				u.UserInputMessageContext.Tools = nil
+				if len(u.UserInputMessageContext.ToolResults) == 0 {
+					u.UserInputMessageContext = nil
+				}
+			}
+			if strings.TrimSpace(u.Content) == "" && len(u.Images) == 0 {
+				if u.UserInputMessageContext != nil && len(u.UserInputMessageContext.ToolResults) > 0 {
+					// A tool-results-only turn still needs a non-empty text
+					// field for the upstream's validation.
+					u.Content = toolResultsContinuationPrefix
+				} else {
+					u.Content = minimalFallbackUserContent
+				}
+			}
+			if len(cleaned) > 0 {
+				last := cleaned[len(cleaned)-1]
+				if last.UserInputMessage != nil &&
+					u.UserInputMessageContext == nil &&
+					strings.TrimSpace(last.UserInputMessage.Content) == strings.TrimSpace(u.Content) &&
+					strings.TrimSpace(u.Content) != "" &&
+					len(u.Images) == 0 {
+					continue // skip duplicate consecutive user turn
+				}
+			}
+		}
+		cleaned = append(cleaned, msg)
+	}
 	return trimLeadingAssistantHistory(cleaned)
 }
 

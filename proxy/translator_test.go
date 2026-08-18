@@ -5,6 +5,15 @@ import (
 	"testing"
 )
 
+// pinLegacyToolHistory forces the legacy flattening sanitizer for tests that
+// assert the pre-structured-history behavior.
+func pinLegacyToolHistory(t *testing.T) {
+	t.Helper()
+	old := structuredToolHistoryEnabled
+	structuredToolHistoryEnabled = false
+	t.Cleanup(func() { structuredToolHistoryEnabled = old })
+}
+
 func TestExtractOpenAIMessageTextStructured(t *testing.T) {
 	content := []interface{}{
 		map[string]interface{}{"type": "text", "text": "alpha"},
@@ -136,6 +145,7 @@ func TestOpenAIToKiroAssistantMapContentInHistory(t *testing.T) {
 }
 
 func TestOpenAIToKiroAssistantToolCallsDoNotInjectPlaceholder(t *testing.T) {
+	pinLegacyToolHistory(t)
 	req := &OpenAIRequest{
 		Model: "claude-sonnet-4.5",
 		Messages: []OpenAIMessage{
@@ -671,6 +681,7 @@ func TestOpenAIToolResultImageAttachedToCurrentMessage(t *testing.T) {
 }
 
 func TestOpenAIToolResultImageCarriedWhenFollowedByUser(t *testing.T) {
+	pinLegacyToolHistory(t)
 	const dataURL = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
 	req := &OpenAIRequest{
 		Model: "claude-sonnet-4.5",
