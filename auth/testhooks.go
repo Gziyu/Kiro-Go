@@ -14,6 +14,17 @@ func SetOIDCTokenURLForTest(fn func(region string) string) {
 // can restore it after replacement.
 func GetOIDCTokenURLForTest() func(region string) string { return oidcTokenURL }
 
+// SetKiroOAuthTokenURLForTest replaces the Kiro PKCE token endpoint. Test-only.
+func SetKiroOAuthTokenURLForTest(fn func() string) {
+	if fn == nil {
+		return
+	}
+	kiroOAuthTokenURL = fn
+}
+
+// GetKiroOAuthTokenURLForTest returns the current Kiro PKCE token endpoint builder.
+func GetKiroOAuthTokenURLForTest() func() string { return kiroOAuthTokenURL }
+
 // SetGlobalAuthClientForTest swaps the global auth HTTP client. The package's
 // init() installs a client whose Transport calls http.ProxyFromEnvironment, and
 // that function caches env vars on first call — which corrupts later tests

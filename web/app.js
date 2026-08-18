@@ -23,6 +23,8 @@
   let promptRules = [];
   let builderIdSession = '';
   let builderIdPollTimer = null;
+  let kiroOAuthSession = '';
+  let kiroOAuthPollTimer = null;
   let iamSession = '';
   let microsoftSession = '';
   let microsoftSelectionId = '';
@@ -2064,6 +2066,7 @@
 
   // Add-account modal templates
   var METHOD_ICONS = {
+    oauth: 'fa-solid fa-globe',
     builderid: 'fa-solid fa-id-card',
     iam: 'fa-solid fa-key',
     microsoft: 'fa-brands fa-microsoft',
@@ -2089,6 +2092,7 @@
     const title = $('modalTitle');
     const body = $('modalBody');
     if (type === 'add') modalAdd(title, body);
+    else if (type === 'oauth') modalKiroOAuth(title, body);
     else if (type === 'builderid') modalBuilderId(title, body);
     else if (type === 'iam') modalIam(title, body);
     else if (type === 'microsoft') openMicrosoftModal(title, body);
@@ -2104,6 +2108,7 @@
     closeDialog('addModal');
     resetMicrosoftFlow(true);
     iamSession = '';
+    cancelKiroOAuthLogin(true);
     if (builderIdPollTimer) { clearTimeout(builderIdPollTimer); builderIdPollTimer = null; }
     builderIdSession = '';
   }
@@ -2111,6 +2116,7 @@
     title.textContent = t('modal.addAccount');
     body.innerHTML =
       '<div class="method-list">' +
+      methodCard('oauth', t('modal.kiroOAuthTitle'), t('modal.kiroOAuthDesc')) +
       methodCard('builderid', t('modal.builderIdTitle'), t('modal.builderIdDesc')) +
       methodCard('iam', t('modal.iamTitle'), t('modal.iamDesc')) +
       methodCard('microsoft', t('modal.microsoftTitle'), t('modal.microsoftDesc')) +
@@ -2121,6 +2127,35 @@
       methodCard('apikey', t('modal.apiKeyTitle'), t('modal.apiKeyDesc')) +
       '</div>' +
       '<div class="modal-footer"><button class="btn btn-secondary" data-close-add="1" type="button">' + escapeHtml(t('common.cancel')) + '</button></div>';
+  }
+  function modalKiroOAuth(title, body) {
+    title.textContent = t('modal.kiroOAuthTitle');
+    body.innerHTML =
+      '<p class="help-block">' + escapeHtml(t('modal.kiroOAuthDesc')) + '</p>' +
+      '<div id="kiroOAuthStep1">' +
+      '<div class="message message-info"><p>' + escapeHtml(t('kiroOAuth.tunnelHint')) + '</p></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('kiroOAuth.callbackBase')) + '</label>' +
+      '<input type="text" id="kiroOAuthCallbackBase" value="http://localhost:3128" placeholder="http://localhost:3128" /></div>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
+      '<button class="btn btn-primary" id="startKiroOAuthBtn" type="button">' + escapeHtml(t('kiroOAuth.start')) + '</button>' +
+      '</div></div>' +
+      '<div id="kiroOAuthStep2" class="hidden">' +
+      '<div class="form-group"><label>' + escapeHtml(t('kiroOAuth.authorizationUrl')) + '</label>' +
+      '<div class="endpoint"><span id="kiroOAuthUrl" class="font-mono text-xs"></span></div>' +
+      '<div class="flex gap-2 mt-2">' +
+      '<button class="btn btn-sm btn-primary flex-1" id="kiroOAuthOpenBtn" type="button">' + escapeHtml(t('builderid.open')) + '</button>' +
+      '<button class="btn btn-sm btn-outline flex-1" id="kiroOAuthCopyBtn" type="button">' + escapeHtml(t('common.copy')) + '</button>' +
+      '</div></div>' +
+      '<p id="kiroOAuthStatus" class="text-center text-sm mt-4 muted-text">' + escapeHtml(t('kiroOAuth.waiting')) + '</p>' +
+      '<div class="form-group mt-4"><label>' + escapeHtml(t('kiroOAuth.manualCallback')) + '</label>' +
+      '<p class="help-block">' + escapeHtml(t('kiroOAuth.manualHint')) + '</p>' +
+      '<input type="text" id="kiroOAuthCallbackUrl" placeholder="http://localhost:3128/oauth/callback?..." /></div>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" id="kiroOAuthCancelBtn" type="button">' + escapeHtml(t('common.cancel')) + '</button>' +
+      '<button class="btn btn-primary" id="kiroOAuthSubmitBtn" type="button">' + escapeHtml(t('kiroOAuth.submit')) + '</button>' +
+      '</div></div>';
+    $('startKiroOAuthBtn').addEventListener('click', startKiroOAuthLogin);
   }
   function modalBuilderId(title, body) {
     title.textContent = t('modal.builderIdTitle');
@@ -2631,6 +2666,100 @@
       if (d.accounts) d.accounts.forEach(a => autoRefreshNewAccount(a.id));
     } else toastError(t('common.failed') + ': ' + (d.error || ''));
   }
+  async function startKiroOAuthLogin() {
+    const callbackBase = String($('kiroOAuthCallbackBase')?.value || '').trim();
+    const button = $('startKiroOAuthBtn');
+    if (!callbackBase) { toastWarning(t('kiroOAuth.callbackRequired')); return; }
+    if (button) button.disabled = true;
+    try {
+      const res = await api('/auth/kiro-oauth/start', {
+        method: 'POST',
+        body: JSON.stringify({ callbackBase })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || t('common.failed'));
+      kiroOAuthSession = data.sessionId;
+      $('kiroOAuthStep1').classList.add('hidden');
+      $('kiroOAuthStep2').classList.remove('hidden');
+      renderEndpointCode('kiroOAuthUrl', data.authorizationUrl);
+      $('kiroOAuthOpenBtn').addEventListener('click', () => window.open(data.authorizationUrl, '_blank', 'noopener'));
+      $('kiroOAuthCopyBtn').addEventListener('click', async () => {
+        await copyText(data.authorizationUrl);
+        toastPrimary(t('common.copied'));
+      });
+      $('kiroOAuthSubmitBtn').addEventListener('click', submitKiroOAuthCallback);
+      $('kiroOAuthCancelBtn').addEventListener('click', () => cancelKiroOAuthLogin(false));
+      window.open(data.authorizationUrl, '_blank', 'noopener');
+      pollKiroOAuthStatus(data.interval || 1);
+    } catch (e) {
+      toastError(e.message || t('common.failed'));
+      if (button) button.disabled = false;
+    }
+  }
+  function pollKiroOAuthStatus(interval) {
+    if (!kiroOAuthSession) return;
+    if (kiroOAuthPollTimer) clearTimeout(kiroOAuthPollTimer);
+    kiroOAuthPollTimer = setTimeout(async () => {
+      try {
+        const res = await api('/auth/kiro-oauth/status', {
+          method: 'POST', body: JSON.stringify({ sessionId: kiroOAuthSession })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || t('common.failed'));
+        if (data.status === 'completed') {
+          kiroOAuthSession = '';
+          kiroOAuthPollTimer = null;
+          toastPrimary(t('kiroOAuth.success') + ': ' + (data.account?.email || data.account?.id || 'Kiro'));
+          closeModal();
+          loadData();
+          return;
+        }
+        if (data.status === 'error') throw new Error(data.error || t('common.failed'));
+        const status = $('kiroOAuthStatus');
+        if (status) status.textContent = data.status === 'processing' ? t('kiroOAuth.processing') : t('kiroOAuth.waiting');
+        pollKiroOAuthStatus(interval);
+      } catch (e) {
+        const status = $('kiroOAuthStatus');
+        if (status) status.textContent = e.message || t('common.failed');
+        toastError(e.message || t('common.failed'));
+        kiroOAuthSession = '';
+        kiroOAuthPollTimer = null;
+      }
+    }, Math.max(1, interval) * 1000);
+  }
+  async function submitKiroOAuthCallback() {
+    const callbackUrl = String($('kiroOAuthCallbackUrl')?.value || '').trim();
+    if (!callbackUrl) { toastWarning(t('kiroOAuth.callbackRequired')); return; }
+    const button = $('kiroOAuthSubmitBtn');
+    if (button) button.disabled = true;
+    try {
+      const res = await api('/auth/kiro-oauth/callback', {
+        method: 'POST', body: JSON.stringify({ sessionId: kiroOAuthSession, callbackUrl })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || t('common.failed'));
+      const status = $('kiroOAuthStatus');
+      if (status) status.textContent = t('kiroOAuth.success');
+      pollKiroOAuthStatus(1);
+    } catch (e) {
+      toastError(e.message || t('common.failed'));
+      if (button) button.disabled = false;
+    }
+  }
+  async function cancelKiroOAuthLogin(silent) {
+    if (kiroOAuthPollTimer) { clearTimeout(kiroOAuthPollTimer); kiroOAuthPollTimer = null; }
+    const sessionId = kiroOAuthSession;
+    kiroOAuthSession = '';
+    if (sessionId) {
+      try {
+        await api('/auth/kiro-oauth/cancel', {
+          method: 'POST', body: JSON.stringify({ sessionId })
+        });
+      } catch (e) { }
+    }
+    if (!silent) closeModal();
+  }
+
   async function startBuilderIdLogin() {
     const region = $('builderIdRegion').value || 'us-east-1';
     const res = await api('/auth/builderid/start', { method: 'POST', body: JSON.stringify({ region }) });

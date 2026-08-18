@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"kiro-go/auth"
 	"kiro-go/config"
@@ -80,6 +81,8 @@ type Handler struct {
 	promptCache        *promptCacheTracker
 	tokenRefreshMu     sync.Mutex
 	credentialImportMu sync.Mutex
+	kiroOAuthSessions  map[string]*kiroOAuthSession
+	kiroOAuthMu        sync.Mutex
 	// 请求日志 (环形缓冲区，包含成功和失败)
 	requestLogs   []RequestLog
 	requestLogsMu sync.RWMutex
@@ -89,6 +92,14 @@ type Handler struct {
 	microsoftFlowMu       sync.Mutex
 	microsoftCanceled     map[string]time.Time
 	microsoftDiscoveries  map[string]*microsoftProfileDiscovery
+}
+
+type kiroOAuthSession struct {
+	start      *auth.KiroOAuthStart
+	processing bool
+	completed  bool
+	account    *config.Account
+	err        string
 }
 
 type microsoftProfileSelection struct {
@@ -290,6 +301,7 @@ func NewHandler() *Handler {
 		stopRefresh:          make(chan struct{}),
 		stopStatsSaver:       make(chan struct{}),
 		promptCache:          newPromptCacheTracker(defaultPromptCacheTTL),
+		kiroOAuthSessions:    make(map[string]*kiroOAuthSession),
 		microsoftSelections:  make(map[string]*microsoftProfileSelection),
 		microsoftCanceled:    make(map[string]time.Time),
 		microsoftDiscoveries: make(map[string]*microsoftProfileDiscovery),
@@ -451,6 +463,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 管理端点
 	case path == "/admin" || path == "/admin/":
 		h.serveAdminPage(w, r)
+	case path == "/oauth/callback" || path == "/signin/callback":
+		h.handleKiroOAuthCallback(w, r)
 	case strings.HasPrefix(path, "/admin/api/"):
 		h.handleAdminAPI(w, r)
 	case strings.HasPrefix(path, "/admin/"):
@@ -2458,6 +2472,14 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiDeleteAccount(w, r, strings.TrimPrefix(path, "/accounts/"))
 	case strings.HasPrefix(path, "/accounts/") && r.Method == "PUT":
 		h.apiUpdateAccount(w, r, strings.TrimPrefix(path, "/accounts/"))
+	case path == "/auth/kiro-oauth/start" && r.Method == "POST":
+		h.apiStartKiroOAuth(w, r)
+	case path == "/auth/kiro-oauth/status" && r.Method == "POST":
+		h.apiKiroOAuthStatus(w, r)
+	case path == "/auth/kiro-oauth/callback" && r.Method == "POST":
+		h.apiSubmitKiroOAuthCallback(w, r)
+	case path == "/auth/kiro-oauth/cancel" && r.Method == "POST":
+		h.apiCancelKiroOAuth(w, r)
 	case path == "/auth/iam-sso/start" && r.Method == "POST":
 		h.apiStartIamSso(w, r)
 	case path == "/auth/iam-sso/complete" && r.Method == "POST":
@@ -3465,6 +3487,265 @@ func (h *Handler) writeAddAccountError(w http.ResponseWriter, err error, rotated
 		}
 	}
 	json.NewEncoder(w).Encode(payload)
+}
+
+func (h *Handler) apiStartKiroOAuth(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		CallbackBase string `json:"callbackBase"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	start, err := auth.StartKiroOAuth(req.CallbackBase)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	h.kiroOAuthMu.Lock()
+	h.cleanupKiroOAuthSessionsLocked(time.Now())
+	h.kiroOAuthSessions[start.ID] = &kiroOAuthSession{start: start}
+	h.kiroOAuthMu.Unlock()
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"sessionId":        start.ID,
+		"authorizationUrl": start.AuthorizationURL,
+		"callbackBase":     start.CallbackBase,
+		"expiresIn":        int(time.Until(start.ExpiresAt).Seconds()),
+		"interval":         1,
+	})
+}
+
+func (h *Handler) apiKiroOAuthStatus(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID string `json:"sessionId"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	h.kiroOAuthMu.Lock()
+	session := h.kiroOAuthSessions[strings.TrimSpace(req.SessionID)]
+	if session == nil {
+		h.kiroOAuthMu.Unlock()
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{"error": "OAuth session not found or expired"})
+		return
+	}
+	if time.Now().After(session.start.ExpiresAt) && !session.completed {
+		delete(h.kiroOAuthSessions, session.start.ID)
+		h.kiroOAuthMu.Unlock()
+		w.WriteHeader(http.StatusGone)
+		json.NewEncoder(w).Encode(map[string]string{"error": "OAuth session expired"})
+		return
+	}
+	processing, completed, failure := session.processing, session.completed, session.err
+	var account map[string]string
+	if session.account != nil {
+		account = map[string]string{"id": session.account.ID, "email": session.account.Email}
+	}
+	if completed || failure != "" {
+		delete(h.kiroOAuthSessions, session.start.ID)
+	}
+	h.kiroOAuthMu.Unlock()
+
+	status := "pending"
+	if processing {
+		status = "processing"
+	}
+	if completed {
+		status = "completed"
+	}
+	if failure != "" {
+		status = "error"
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  status,
+		"account": account,
+		"error":   failure,
+	})
+}
+
+func (h *Handler) apiSubmitKiroOAuthCallback(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID   string `json:"sessionId"`
+		CallbackURL string `json:"callbackUrl"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	if err := h.completeKiroOAuth(strings.TrimSpace(req.SessionID), strings.TrimSpace(req.CallbackURL)); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "status": "completed"})
+}
+
+func (h *Handler) apiCancelKiroOAuth(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID string `json:"sessionId"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	h.kiroOAuthMu.Lock()
+	delete(h.kiroOAuthSessions, strings.TrimSpace(req.SessionID))
+	h.kiroOAuthMu.Unlock()
+	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+func (h *Handler) handleKiroOAuthCallback(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	rawCallback := "http://localhost" + r.URL.RequestURI()
+	sessionID := h.findKiroOAuthSessionByState(r.URL.Query().Get("state"))
+	if sessionID == "" {
+		h.writeKiroOAuthCallbackPage(w, false, "授权会话不存在或已经过期")
+		return
+	}
+	if err := h.completeKiroOAuth(sessionID, rawCallback); err != nil {
+		h.writeKiroOAuthCallbackPage(w, false, err.Error())
+		return
+	}
+	h.writeKiroOAuthCallbackPage(w, true, "Kiro 账号已添加，可以关闭此页面")
+}
+
+func (h *Handler) findKiroOAuthSessionByState(state string) string {
+	state = strings.TrimSpace(state)
+	if state == "" {
+		return ""
+	}
+	h.kiroOAuthMu.Lock()
+	defer h.kiroOAuthMu.Unlock()
+	h.cleanupKiroOAuthSessionsLocked(time.Now())
+	for id, session := range h.kiroOAuthSessions {
+		if session.start.State == state {
+			return id
+		}
+	}
+	return ""
+}
+
+func (h *Handler) completeKiroOAuth(sessionID, rawCallback string) error {
+	h.kiroOAuthMu.Lock()
+	session := h.kiroOAuthSessions[sessionID]
+	if session == nil {
+		h.kiroOAuthMu.Unlock()
+		return fmt.Errorf("OAuth session not found or expired")
+	}
+	if time.Now().After(session.start.ExpiresAt) {
+		delete(h.kiroOAuthSessions, sessionID)
+		h.kiroOAuthMu.Unlock()
+		return fmt.Errorf("OAuth session expired")
+	}
+	if session.completed {
+		h.kiroOAuthMu.Unlock()
+		return nil
+	}
+	if session.processing {
+		h.kiroOAuthMu.Unlock()
+		return fmt.Errorf("OAuth callback is already being processed")
+	}
+	session.processing = true
+	start := *session.start
+	h.kiroOAuthMu.Unlock()
+
+	setFailure := func(err error) error {
+		h.kiroOAuthMu.Lock()
+		if current := h.kiroOAuthSessions[sessionID]; current != nil {
+			current.processing = false
+			current.err = err.Error()
+		}
+		h.kiroOAuthMu.Unlock()
+		return err
+	}
+
+	callback, err := auth.ParseKiroOAuthCallback(rawCallback, start.State)
+	if err != nil {
+		h.kiroOAuthMu.Lock()
+		if current := h.kiroOAuthSessions[sessionID]; current != nil {
+			current.processing = false
+		}
+		h.kiroOAuthMu.Unlock()
+		return err
+	}
+	token, err := auth.ExchangeKiroOAuthCode(callback, start.CodeVerifier, start.CallbackBase)
+	if err != nil {
+		return setFailure(err)
+	}
+	if config.AccountCredentialExists(token.RefreshToken) {
+		return setFailure(config.ErrDuplicateRefreshToken)
+	}
+
+	email, userID, _ := auth.GetUserInfo(token.AccessToken)
+	account := config.Account{
+		ID:           auth.GenerateAccountID(),
+		Email:        strings.TrimSpace(email),
+		UserId:       strings.TrimSpace(userID),
+		AccessToken:  token.AccessToken,
+		RefreshToken: token.RefreshToken,
+		AuthMethod:   "social",
+		Provider:     auth.KiroOAuthProvider(callback.LoginOption),
+		Region:       "us-east-1",
+		ExpiresAt:    token.ExpiresAt,
+		ProfileArn:   token.ProfileArn,
+		Enabled:      true,
+		MachineId:    config.GenerateMachineId(),
+	}
+	if account.Email == "" {
+		account.Email = strings.ToLower(account.Provider) + "-oauth"
+	}
+	if err := config.AddAccount(account); err != nil {
+		return setFailure(err)
+	}
+	h.pool.Reload()
+
+	h.kiroOAuthMu.Lock()
+	if current := h.kiroOAuthSessions[sessionID]; current != nil {
+		current.processing = false
+		current.completed = true
+		current.account = &account
+		current.err = ""
+	}
+	h.kiroOAuthMu.Unlock()
+	logger.Infof("[KiroOAuth] Added %s account %s", account.Provider, account.Email)
+	return nil
+}
+
+func (h *Handler) cleanupKiroOAuthSessionsLocked(now time.Time) {
+	for id, session := range h.kiroOAuthSessions {
+		if session == nil || session.start == nil || now.After(session.start.ExpiresAt.Add(time.Minute)) {
+			delete(h.kiroOAuthSessions, id)
+		}
+	}
+}
+
+func (h *Handler) writeKiroOAuthCallbackPage(w http.ResponseWriter, success bool, message string) {
+	status := http.StatusOK
+	title := "授权成功"
+	color := "#059669"
+	if !success {
+		status = http.StatusBadRequest
+		title = "授权失败"
+		color = "#dc2626"
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	fmt.Fprintf(w, `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>%s</title></head><body style="font-family:system-ui;background:#f4f6f8;display:grid;place-items:center;min-height:100vh;margin:0"><main style="background:white;padding:32px;border-radius:14px;box-shadow:0 12px 40px #0002;text-align:center;max-width:520px"><h1 style="color:%s">%s</h1><p>%s</p></main></body></html>`, html.EscapeString(title), color, html.EscapeString(title), html.EscapeString(message))
 }
 
 func (h *Handler) apiStartBuilderIdLogin(w http.ResponseWriter, r *http.Request) {
